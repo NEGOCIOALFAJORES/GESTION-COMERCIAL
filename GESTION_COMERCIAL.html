@@ -1132,73 +1132,143 @@ function delMovCaja(id){
 }
 
 // ================= GOOGLE DRIVE =================
+// 1) Reemplazá esto por el Client ID que te da Google Cloud Console (ver instrucciones que te di en el chat).
 const GOOGLE_CLIENT_ID = '137451388719-9vg3ec0chjhi72nsn7cjburm8uklff73.apps.googleusercontent.com';
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const DRIVE_FILENAME = 'gestion-comercial-backup.json';
+const DRIVE_POLL_MS = 20000; // cada cuánto chequea si hay cambios nuevos en Drive
 
 let driveTokenClient = null;
 let driveAccessToken = null;
 let driveFileId = localStorage.getItem('drive-file-id') || null;
 let driveConnected = false;
+let driveLastModified = null;
 let _driveUploadTimer = null;
+let _drivePollTimer = null;
+let _driveManualConnect = false;
+let _driveRemotePending = null;
 
 function driveBtn(){ return document.getElementById('btn-drive'); }
+function driveClientReady(){ return GOOGLE_CLIENT_ID && GOOGLE_CLIENT_ID.indexOf('TU_CLIENT_ID')!==0; }
 
 function initDriveClient(){
   if(driveTokenClient) return true;
   if(typeof google === 'undefined' || !google.accounts || !google.accounts.oauth2){
-    toast('No se pudo cargar Google. Revisá tu conexión a internet e intentá de nuevo.');
+    if(_driveManualConnect) toast('No se pudo cargar Google. Revisá tu conexión a internet e intentá de nuevo.');
     return false;
   }
   driveTokenClient = google.accounts.oauth2.initTokenClient({
     client_id: GOOGLE_CLIENT_ID,
     scope: DRIVE_SCOPE,
     callback: (resp)=>{
-      if(resp.error){ toast('No se pudo conectar con Google Drive.'); return; }
+      if(resp.error){
+        if(_driveManualConnect) toast('No se pudo conectar con Google Drive.');
+        return;
+      }
       driveAccessToken = resp.access_token;
       driveConnected = true;
-      onDriveConnected();
+      driveBtn().textContent = '🟢 Drive conectado';
+      startDrivePolling();
+      onDriveConnected(_driveManualConnect);
     }
   });
   return true;
 }
 
 function toggleDriveConnect(){
-  if(!GOOGLE_CLIENT_ID || GOOGLE_CLIENT_ID.indexOf('TU_CLIENT_ID')===0){
-    toast('Todavía falta configurar el Client ID de Google en el código. Mirá las instrucciones que te pasé.');
+  if(!driveClientReady()){
+    toast('Todavía falta configurar el Client ID de Google en el código.');
     return;
   }
   if(driveConnected){
     driveConnected = false; driveAccessToken = null;
+    stopDrivePolling();
     driveBtn().textContent = '🔗 Google Drive';
     toast('Desconectado de Google Drive (solo en este dispositivo/pestaña).');
     return;
   }
+  _driveManualConnect = true;
   if(!initDriveClient()) return;
   driveTokenClient.requestAccessToken({ prompt: driveFileId ? '' : 'consent' });
 }
 
-async function onDriveConnected(){
-  driveBtn().textContent = '🟢 Drive conectado';
-  if(driveFileId){
-    // Este dispositivo ya estaba vinculado a un backup: lo actualizamos con lo que hay acá.
-    await driveUploadNow();
-    toast('Conectado. Sincronizando con Google Drive…');
-  } else {
-    const existingId = await driveFindExistingFile();
-    if(existingId){
-      openModal(`
-        <h3>Encontramos un backup en tu Drive</h3>
-        <p style="font-size:13.5px;color:var(--ink-soft);line-height:1.5;">Ya existe un archivo "${DRIVE_FILENAME}" guardado en tu Google Drive de otra vez que conectaste la app. ¿Qué querés hacer?</p>
-        <div class="modal-actions" style="flex-direction:column;gap:8px;align-items:stretch;">
-          <button class="btn primary" onclick="driveUseRemote('${existingId}')">Traer los datos de Drive (reemplaza lo que ves acá)</button>
-          <button class="btn" onclick="driveUseLocal('${existingId}')">Subir lo que tengo acá (reemplaza lo de Drive)</button>
-        </div>`);
-    } else {
-      await driveCreateFile();
-      toast('Conectado a Google Drive. Se creó el backup automático.');
+// Al abrir la app, si este dispositivo ya se había conectado antes, reintenta solo (sin pedir permisos de nuevo).
+function driveAutoReconnect(){
+  if(!driveFileId || !driveClientReady()) return;
+  _driveManualConnect = false;
+  let tries = 0;
+  const tryInit = ()=>{
+    tries++;
+    if(typeof google !== 'undefined' && google.accounts && google.accounts.oauth2){
+      if(!initDriveClient()) return;
+      driveTokenClient.requestAccessToken({ prompt: '' });
+    } else if(tries < 20){
+      setTimeout(tryInit, 250);
     }
+  };
+  tryInit();
+}
+window.addEventListener('load', driveAutoReconnect);
+
+// Si volvés a esta pestaña (por ejemplo, cambiaste de app en la tablet y volviste), chequea al toque si hay novedades.
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible' && driveConnected){ drivePollCheck(); }
+});
+
+async function onDriveConnected(interactive){
+  if(!driveFileId){
+    const existingId = await driveFindExistingFile();
+    if(existingId){ driveFileId = existingId; localStorage.setItem('drive-file-id', driveFileId); }
   }
+  if(!driveFileId){
+    await driveCreateFile();
+    if(interactive) toast('Conectado a Google Drive. Se creó el backup automático.');
+    return;
+  }
+  await driveSyncOnConnect(interactive);
+}
+
+async function driveSyncOnConnect(interactive){
+  try{
+    const metaRes = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?fields=modifiedTime`, {
+      headers: { Authorization: 'Bearer ' + driveAccessToken }
+    });
+    if(!metaRes.ok) throw new Error('meta '+metaRes.status);
+    const meta = await metaRes.json();
+    const contentRes = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
+      headers: { Authorization: 'Bearer ' + driveAccessToken }
+    });
+    const remoteDB = await contentRes.json();
+    driveLastModified = meta.modifiedTime;
+    if(JSON.stringify(remoteDB) !== JSON.stringify(DB)){
+      _driveRemotePending = remoteDB;
+      openModal(`
+        <h3>Hay cambios distintos en Google Drive</h3>
+        <p style="font-size:13.5px;color:var(--ink-soft);line-height:1.5;">Los datos de este dispositivo no coinciden con los de Drive (probablemente porque cargaste algo en otro dispositivo). ¿Qué querés hacer?</p>
+        <div class="modal-actions" style="flex-direction:column;gap:8px;align-items:stretch;">
+          <button class="btn primary" onclick="driveApplyRemote()">Traer los datos de Drive (recomendado)</button>
+          <button class="btn" onclick="driveKeepLocal()">Mantener lo de este dispositivo</button>
+        </div>`);
+    } else if(interactive){
+      toast('Conectado. Ya estás al día con Google Drive.');
+    }
+  }catch(e){ console.error(e); if(interactive) toast('Conectado, pero no se pudo comparar con Drive.'); }
+}
+
+function driveApplyRemote(){
+  if(!_driveRemotePending) return;
+  DB = _driveRemotePending; ensureDBShape();
+  _driveRemotePending = null;
+  closeModal();
+  try{ localStorage.setItem('gestion-db', JSON.stringify(DB)); }catch(e){}
+  renderAll();
+  toast('Datos actualizados desde Google Drive.');
+}
+function driveKeepLocal(){
+  _driveRemotePending = null;
+  closeModal();
+  driveUploadNow();
+  toast('Se subió lo de este dispositivo a Drive.');
 }
 
 async function driveFindExistingFile(){
@@ -1221,13 +1291,13 @@ async function driveCreateFile(){
       `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
       `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(DB)}\r\n` +
       `--${boundary}--`;
-    const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+    const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,modifiedTime', {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + driveAccessToken, 'Content-Type': `multipart/related; boundary=${boundary}` },
       body
     });
     const data = await res.json();
-    if(data.id){ driveFileId = data.id; localStorage.setItem('drive-file-id', driveFileId); }
+    if(data.id){ driveFileId = data.id; driveLastModified = data.modifiedTime; localStorage.setItem('drive-file-id', driveFileId); }
     else { toast('No se pudo crear el archivo en Drive.'); }
   }catch(e){ console.error(e); toast('No se pudo crear el archivo en Drive.'); }
 }
@@ -1235,11 +1305,13 @@ async function driveCreateFile(){
 async function driveUploadNow(){
   if(!driveConnected || !driveAccessToken || !driveFileId) return;
   try{
-    await fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`, {
+    const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media&fields=modifiedTime`, {
       method: 'PATCH',
       headers: { Authorization: 'Bearer ' + driveAccessToken, 'Content-Type': 'application/json' },
       body: JSON.stringify(DB)
     });
+    const data = await res.json();
+    if(data.modifiedTime) driveLastModified = data.modifiedTime;
     showSaveIndicator();
   }catch(e){ console.error(e); }
 }
@@ -1249,24 +1321,45 @@ function scheduleDriveUpload(){
   _driveUploadTimer = setTimeout(driveUploadNow, 1500);
 }
 
-async function driveUseRemote(id){
-  closeModal();
+// Chequeo periódico: si otro dispositivo subió cambios, los trae solo.
+function startDrivePolling(){
+  stopDrivePolling();
+  _drivePollTimer = setInterval(drivePollCheck, DRIVE_POLL_MS);
+}
+function stopDrivePolling(){
+  if(_drivePollTimer){ clearInterval(_drivePollTimer); _drivePollTimer = null; }
+}
+async function drivePollCheck(){
+  if(!driveConnected || !driveFileId || !driveAccessToken) return;
   try{
-    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`, {
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?fields=modifiedTime`, {
       headers: { Authorization: 'Bearer ' + driveAccessToken }
     });
-    const data = await res.json();
-    DB = data; ensureDBShape();
-    driveFileId = id; localStorage.setItem('drive-file-id', driveFileId);
-    saveAll(); renderAll();
-    toast('Datos traídos desde Google Drive.');
-  }catch(e){ console.error(e); toast('No se pudo traer el backup de Drive.'); }
-}
-async function driveUseLocal(id){
-  closeModal();
-  driveFileId = id; localStorage.setItem('drive-file-id', driveFileId);
-  await driveUploadNow();
-  toast('Se subió lo que tenías acá a Google Drive.');
+    if(res.status===401){
+      // El token venció (dura ~1hs): reintenta en silencio, sin pedirle nada al usuario.
+      stopDrivePolling();
+      _driveManualConnect = false;
+      if(driveTokenClient) driveTokenClient.requestAccessToken({ prompt: '' });
+      return;
+    }
+    if(!res.ok) return;
+    const meta = await res.json();
+    if(driveLastModified && meta.modifiedTime !== driveLastModified){
+      const contentRes = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
+        headers: { Authorization: 'Bearer ' + driveAccessToken }
+      });
+      const remoteDB = await contentRes.json();
+      driveLastModified = meta.modifiedTime;
+      if(JSON.stringify(remoteDB) !== JSON.stringify(DB)){
+        DB = remoteDB; ensureDBShape();
+        try{ localStorage.setItem('gestion-db', JSON.stringify(DB)); }catch(e){}
+        renderAll();
+        toast('Se actualizaron los datos desde Google Drive.');
+      }
+    } else if(!driveLastModified){
+      driveLastModified = meta.modifiedTime;
+    }
+  }catch(e){ console.error(e); }
 }
 
 loadAll();
