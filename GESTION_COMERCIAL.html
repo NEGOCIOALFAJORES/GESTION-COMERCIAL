@@ -925,12 +925,21 @@ function addVentaItem(){
 function renderVentaItems(){
   const cont = document.getElementById('venta-items-list');
   cont.innerHTML = ventaItems.length ? ventaItems.map((i,idx)=>`
-    <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--line);font-size:13.5px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:13.5px;">
       <span>${i.cantidad}x ${i.nombre}</span>
-      <span style="display:flex;gap:10px;align-items:center;">${fmt(i.precio*i.cantidad)} <button class="btn icon danger" onclick="removeVentaItem(${idx})">x</button></span>
+      <span style="display:flex;gap:6px;align-items:center;">
+        $<input type="number" step="0.01" value="${i.precio}" onchange="updateVentaItemPrecio(${idx}, this.value)" style="width:78px;padding:4px 6px;">
+        <span class="muted" style="font-size:12px;min-width:70px;text-align:right;">${fmt(i.precio*i.cantidad)}</span>
+        <button class="btn icon danger" onclick="removeVentaItem(${idx})">x</button>
+      </span>
     </div>`).join('') : `<div class="muted" style="font-size:13px;">Todavía no agregaste productos.</div>`;
   const total = ventaItems.reduce((s,i)=>s+i.precio*i.cantidad,0);
   document.getElementById('venta-total').textContent = 'Total: ' + fmt(total);
+}
+function updateVentaItemPrecio(idx, valor){
+  const p = parseFloat(valor);
+  ventaItems[idx].precio = isNaN(p) || p<0 ? 0 : p;
+  renderVentaItems();
 }
 function removeVentaItem(idx){ ventaItems.splice(idx,1); renderVentaItems(); }
 function confirmarVenta(){
