@@ -476,11 +476,12 @@ function renderProductos(filter=''){
   const q = (document.getElementById('prod-search')?.value || filter).toLowerCase();
   const list = DB.productos.filter(p=>p.nombre.toLowerCase().includes(q));
   const html = list.length ? `
-    <table><thead><tr><th>Producto</th><th>Precio</th><th>Costo</th><th>Stock</th><th></th><th></th></tr></thead>
+    <table><thead><tr><th>Producto</th><th>Precio</th><th>Mayorista</th><th>Costo</th><th>Stock</th><th></th><th></th></tr></thead>
     <tbody>${list.map(p=>`
       <tr>
         <td>${p.nombre}</td>
         <td>${fmt(p.precio)}</td>
+        <td>${p.precioMayorista>0 ? fmt(p.precioMayorista) : '—'}</td>
         <td>${fmt(p.costo)}</td>
         <td>${p.stock} <span class="pill ${p.stock<=p.stockMin?'low':'ok'}">${p.stock<=p.stockMin?'bajo':'ok'}</span></td>
         <td><button class="btn icon" onclick="editProducto('${p.id}')">Editar</button></td>
@@ -495,7 +496,8 @@ function productoForm(p){
   return `
     <h3>${p?'Editar producto':'Nuevo producto'}</h3>
     <div class="field"><label>Nombre</label><input id="f-nombre" value="${p?p.nombre:''}"></div>
-    <div class="field"><label>Precio de venta</label><input id="f-precio" type="number" step="0.01" value="${p?p.precio:''}"></div>
+    <div class="field"><label>Precio de venta (minorista)</label><input id="f-precio" type="number" step="0.01" value="${p?p.precio:''}"></div>
+    <div class="field"><label>Precio mayorista (opcional)</label><input id="f-preciomay" type="number" step="0.01" placeholder="Dejalo vacío si no vendés por mayor" value="${p&&p.precioMayorista?p.precioMayorista:''}"></div>
     <div class="field"><label>Costo</label><input id="f-costo" type="number" step="0.01" value="${p?p.costo:''}"></div>
     <div class="field"><label>Stock actual</label><input id="f-stock" type="number" value="${p?p.stock:0}"></div>
     <div class="field"><label>Stock mínimo (alerta)</label><input id="f-stockmin" type="number" value="${p?p.stockMin:1}"></div>
@@ -512,6 +514,7 @@ function saveProducto(id){
   const data = {
     nombre,
     precio: parseFloat(document.getElementById('f-precio').value)||0,
+    precioMayorista: parseFloat(document.getElementById('f-preciomay').value)||0,
     costo: parseFloat(document.getElementById('f-costo').value)||0,
     stock: parseInt(document.getElementById('f-stock').value)||0,
     stockMin: parseInt(document.getElementById('f-stockmin').value)||0,
@@ -670,13 +673,34 @@ function addPedidoItem(){
 }
 function renderPedidoItems(){
   const cont = document.getElementById('pedido-items-list');
-  cont.innerHTML = pedidoItems.length ? pedidoItems.map((i,idx)=>`
-    <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--line);font-size:13.5px;">
+  cont.innerHTML = pedidoItems.length ? pedidoItems.map((i,idx)=>{
+    const prod = DB.productos.find(x=>x.id===i.productoId);
+    const tieneMayorista = prod && prod.precioMayorista > 0;
+    return `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:13.5px;">
       <span>${i.cantidad}x ${i.nombre}</span>
-      <span style="display:flex;gap:10px;align-items:center;">${fmt(i.precio*i.cantidad)} <button class="btn icon danger" onclick="removePedidoItem(${idx})">x</button></span>
-    </div>`).join('') : `<div class="muted" style="font-size:13px;">Todavía no agregaste productos.</div>`;
+      <span style="display:flex;gap:6px;align-items:center;">
+        ${tieneMayorista ? `
+          <button class="btn icon ${prod && i.precio===prod.precio?'active':''}" style="padding:3px 7px;font-size:11px;" onclick="setPedidoItemPrecio(${idx}, ${prod.precio})">Min</button>
+          <button class="btn icon ${prod && i.precio===prod.precioMayorista?'active':''}" style="padding:3px 7px;font-size:11px;" onclick="setPedidoItemPrecio(${idx}, ${prod.precioMayorista})">May</button>
+        ` : ''}
+        $<input type="number" step="0.01" value="${i.precio}" onchange="updatePedidoItemPrecio(${idx}, this.value)" style="width:78px;padding:4px 6px;">
+        <span class="muted" style="font-size:12px;min-width:70px;text-align:right;">${fmt(i.precio*i.cantidad)}</span>
+        <button class="btn icon danger" onclick="removePedidoItem(${idx})">x</button>
+      </span>
+    </div>`;
+  }).join('') : `<div class="muted" style="font-size:13px;">Todavía no agregaste productos.</div>`;
   const total = pedidoItems.reduce((s,i)=>s+i.precio*i.cantidad,0);
   document.getElementById('pedido-total').textContent = 'Total: ' + fmt(total);
+}
+function setPedidoItemPrecio(idx, precio){
+  pedidoItems[idx].precio = precio;
+  renderPedidoItems();
+}
+function updatePedidoItemPrecio(idx, valor){
+  const p = parseFloat(valor);
+  pedidoItems[idx].precio = isNaN(p) || p<0 ? 0 : p;
+  renderPedidoItems();
 }
 function removePedidoItem(idx){ pedidoItems.splice(idx,1); renderPedidoItems(); }
 function confirmarPedido(){
@@ -924,17 +948,29 @@ function addVentaItem(){
 }
 function renderVentaItems(){
   const cont = document.getElementById('venta-items-list');
-  cont.innerHTML = ventaItems.length ? ventaItems.map((i,idx)=>`
+  cont.innerHTML = ventaItems.length ? ventaItems.map((i,idx)=>{
+    const prod = DB.productos.find(x=>x.id===i.productoId);
+    const tieneMayorista = prod && prod.precioMayorista > 0;
+    return `
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:13.5px;">
       <span>${i.cantidad}x ${i.nombre}</span>
       <span style="display:flex;gap:6px;align-items:center;">
+        ${tieneMayorista ? `
+          <button class="btn icon ${prod && i.precio===prod.precio?'active':''}" style="padding:3px 7px;font-size:11px;" onclick="setVentaItemPrecio(${idx}, ${prod.precio})">Min</button>
+          <button class="btn icon ${prod && i.precio===prod.precioMayorista?'active':''}" style="padding:3px 7px;font-size:11px;" onclick="setVentaItemPrecio(${idx}, ${prod.precioMayorista})">May</button>
+        ` : ''}
         $<input type="number" step="0.01" value="${i.precio}" onchange="updateVentaItemPrecio(${idx}, this.value)" style="width:78px;padding:4px 6px;">
         <span class="muted" style="font-size:12px;min-width:70px;text-align:right;">${fmt(i.precio*i.cantidad)}</span>
         <button class="btn icon danger" onclick="removeVentaItem(${idx})">x</button>
       </span>
-    </div>`).join('') : `<div class="muted" style="font-size:13px;">Todavía no agregaste productos.</div>`;
+    </div>`;
+  }).join('') : `<div class="muted" style="font-size:13px;">Todavía no agregaste productos.</div>`;
   const total = ventaItems.reduce((s,i)=>s+i.precio*i.cantidad,0);
   document.getElementById('venta-total').textContent = 'Total: ' + fmt(total);
+}
+function setVentaItemPrecio(idx, precio){
+  ventaItems[idx].precio = precio;
+  renderVentaItems();
 }
 function updateVentaItemPrecio(idx, valor){
   const p = parseFloat(valor);
